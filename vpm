@@ -3,7 +3,7 @@
 # Setup: Change REPO_URL to your actual server
 
 # Where does Vanadium look for updates?
-REPO_URL="https://your-username.github.io/vanadium-repo"
+REPO_URL="https://gold-is-eepy-now.github.io/vanadium-repo"
 
 DB_DIR="/var/lib/vpm/installed"
 CACHE_DIR="/var/cache/vpm"
