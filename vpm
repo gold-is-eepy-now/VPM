@@ -1,94 +1,131 @@
 #!/usr/bin/env bash
-# vpm v3.0 - Network Enabled
-# Setup: Change REPO_URL to your actual server
+# vpm v4.0
+# Features: Recursive Dependency Resolution
 
-# Where does Vanadium look for updates?
+# --- CONFIG ---
 REPO_URL="https://gold-is-eepy-now.github.io/vanadium-repo"
-
 DB_DIR="/var/lib/vpm/installed"
 CACHE_DIR="/var/cache/vpm"
 INDEX_FILE="$CACHE_DIR/index.txt"
-mkdir -p "$DB_DIR" "$CACHE_DIR"
+TMP_DIR="/tmp/vpm-session-$$"
 
-error() { echo -e "\e[31m[ERROR]\e[0m $1"; exit 1; }
+mkdir -p "$DB_DIR" "$CACHE_DIR" "$TMP_DIR"
+
+# Cleanup temp on exit
+trap "rm -rf $TMP_DIR" EXIT
+
+# Detect System Manager (The "Backend")
+if [[ -f /usr/bin/pacman ]]; then
+    SYS_PM="/usr/bin/pacman"
+    SYS_CMD="$SYS_PM -S --noconfirm --needed"
+    SYS_UPDATE="$SYS_PM -Sy"
+elif [[ -f /sbin/apk ]]; then
+    SYS_PM="/sbin/apk"
+    SYS_CMD="$SYS_PM add"
+    SYS_UPDATE="$SYS_PM update"
+fi
+
 msg()   { echo -e "\e[32m[VPM]\e[0m $1"; }
+error() { echo -e "\e[31m[ERROR]\e[0m $1"; exit 1; }
 
-# --- Helper: Compare Versions ---
-# Returns 0 if $1 == $2, 1 if $1 < $2 (upgrade needed), 2 if $1 > $2
-ver_check() {
-    [[ "$1" == "$2" ]] && return 0
-    local winner=$(echo -e "$1\n$2" | sort -V | tail -n1)
-    [[ "$winner" == "$2" ]] && return 1 # Update available
-    return 2
-}
+# --- CORE FUNCTIONS ---
 
 cmd_update() {
-    msg "Fetching package list from $REPO_URL..."
-    if curl -sfL "$REPO_URL/index.txt" -o "$INDEX_FILE"; then
-        msg "Database updated."
-    else
-        error "Could not reach repository."
-    fi
+    msg "Updating Vanadium Database..."
+    curl -sfL "$REPO_URL/index.txt" -o "$INDEX_FILE" || error "Repo unreachable"
+    msg "Updating System Database..."
+    $SYS_UPDATE
 }
 
-cmd_create() {
-    SRC="$1"; NAME="$2"
-    [[ -d "$SRC" ]] || error "Source directory '$SRC' not found."
-    [[ -z "$NAME" ]] && error "Package name required"
-
-    msg "Building Vanadium Package: $NAME..."
+install_vpkg_file() {
+    local PKG_FILE="$1"
     
-    # Create metadata
-    echo "NAME=$NAME" > "$SRC/PKG_INFO"
-    echo "BUILD_DATE=$(date)" >> "$SRC/PKG_INFO"
+    # 1. Extract Metadata
+    tar -xf "$PKG_FILE" -C "$TMP_DIR" ./PKG_INFO 2>/dev/null || error "Invalid VPKG"
+    source "$TMP_DIR/PKG_INFO"
 
-    # --- CHANGED LINE BELOW ---
-    # We now output .vpkg instead of .tgz
-    tar -czf "$NAME.vpkg" -C "$SRC" .
+    # 2. Check if already installed
+    if [[ -f "$DB_DIR/$NAME" ]]; then
+        echo "Package '$NAME' is already installed. Skipping."
+        return
+    fi
+
+    # 3. RESOLVE DEPENDENCIES (The Magic)
+    if [[ -n "$DEPS" ]]; then
+        msg "Dependency Check for $NAME: [ $DEPS ]"
+        
+        # Split DEPS string into array
+        IFS=' ' read -r -a DEP_ARRAY <<< "$DEPS"
+        
+        for dep in "${DEP_ARRAY[@]}"; do
+            # Recursive Call!
+            cmd_install "$dep"
+        done
+    fi
+
+    # 4. Install the actual files
+    msg "Installing $NAME v$VERSION..."
     
-    msg "Package created: $NAME.vpkg"
+    # Save Metadata
+    mkdir -p "/var/lib/vpm/pkginfo"
+    cp "$TMP_DIR/PKG_INFO" "/var/lib/vpm/pkginfo/$NAME"
+
+    # Extract Files (excluding PKG_INFO)
+    tar -xvf "$PKG_FILE" -C / --exclude='./PKG_INFO' > "$TMP_DIR/filelist"
+    
+    # Update Database
+    cat "$TMP_DIR/filelist" | while read -r file; do
+        if [[ "$file" != "/" ]]; then echo "/$file" >> "$DB_DIR/$NAME"; fi
+    done
+    
+    msg "$NAME installed successfully."
 }
 
 cmd_install() {
-    INPUT="$1"
-    
-    # Is it a URL?
-    if [[ "$INPUT" == http* ]]; then
-        FILENAME=$(basename "$INPUT")
-        msg "Downloading $FILENAME..."
-        curl -L "$INPUT" -o "$CACHE_DIR/$FILENAME"
-        PKG="$CACHE_DIR/$FILENAME"
-    
-    # Is it a local file?
-    elif [[ -f "$INPUT" ]]; then
-        PKG="$INPUT"
-        
-    # Is it just a name? (e.g., 'hello')
-    elif grep -q "^$INPUT " "$INDEX_FILE" 2>/dev/null; then
-        URL=$(grep "^$INPUT " "$INDEX_FILE" | awk '{print $3}')
-        # Recursive call with the URL
-        cmd_install "$URL"
+    local TARGET="$1"
+
+    # CASE A: It's a URL
+    if [[ "$TARGET" == http* ]]; then
+        local FILE=$(basename "$TARGET")
+        curl -L "$TARGET" -o "$CACHE_DIR/$FILE"
+        install_vpkg_file "$CACHE_DIR/$FILE"
         return
-    else
-        # Try appending extension if user forgot it
-        if [[ -f "$INPUT.vpkg" ]]; then
-            PKG="$INPUT.vpkg"
-        else
-            error "Package '$INPUT' not found."
-        fi
     fi
 
-    # ... rest of the install logic remains the same ...
-    # tar -xf handles .vpkg automatically because headers are still gzip
+    # CASE B: It's a local file
+    if [[ -f "$TARGET" ]]; then
+        install_vpkg_file "$TARGET"
+        return
+    fi
+
+    # CASE C: It's a package name in VPM Index
+    if grep -q "^$TARGET " "$INDEX_FILE" 2>/dev/null; then
+        local URL=$(grep "^$TARGET " "$INDEX_FILE" | awk '{print $3}')
+        msg "Found '$TARGET' in Vanadium Repo. Downloading..."
+        local FILE=$(basename "$URL")
+        curl -L "$URL" -o "$CACHE_DIR/$FILE"
+        install_vpkg_file "$CACHE_DIR/$FILE"
+        return
+    fi
+
+    # CASE D: Not in VPM? Pass it to System Manager (Pacman/Apk)
+    msg "'$TARGET' not in VPM. Checking System Repos..."
+    $SYS_CMD "$TARGET"
 }
 
-# ... (Include cmd_create, cmd_remove, cmd_list from V1 here) ...
-
+# --- MAIN LOOP ---
 case "$1" in
     update)  cmd_update ;;
-    upgrade) cmd_upgrade ;;
     install) cmd_install "$2" ;;
-    create)  # (Use V1 logic, but ensure PKG_INFO has VERSION=x.x) 
-             ;;
-    *)       echo "Usage: vpm {update|upgrade|install|remove|create}" ;;
+    remove)  
+        # Simple remove logic
+        if [[ -f "$DB_DIR/$2" ]]; then
+             tac "$DB_DIR/$2" | xargs rm -rf 2>/dev/null
+             rm "$DB_DIR/$2"
+             msg "Removed $2"
+        else
+             error "$2 not found"
+        fi
+        ;;
+    *) echo "Usage: vpm {update|install|remove} <pkg>" ;;
 esac
